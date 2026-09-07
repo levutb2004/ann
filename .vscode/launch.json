@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train TPU",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode",
+                "train_tpu",
+                "--ep",
+                "5",
+                "-y",
+                "2019"
+            ],
+            "python": "/home/vu/miniforge3/envs/gnn/bin/python"
+        }
+    ]
+}
