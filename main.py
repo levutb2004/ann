@@ -15,6 +15,7 @@ from tools import *
 import numpy_indexed as npi
 import pandas as pd
 import gc
+from scipy import ndimage
 # 创建 ArgumentParser 对象
 parser = argparse.ArgumentParser(description='Program description')
 
@@ -22,8 +23,15 @@ parser = argparse.ArgumentParser(description='Program description')
 parser.add_argument('--ckp', type=str, default='None', help='Path to the model checkpoint file')
 parser.add_argument('--ep', type=int, default=50000, help='Number of training epochs')
 parser.add_argument('--mode', type=str,
-                    choices=['train', 'train_tpu', 'map', 'eval'], default='train',
+                    choices=['train', 'train_tpu', 'map', 'map_interval', 'eval'], default='train',
                     help='Program mode')
+parser.add_argument('--nsamples', type=int, default=100, help='Number of posterior/MC Dropout forward passes for mapping_interval')
+parser.add_argument('--modeltype', type=str, choices=['mc_dropout', 'bnn', 'si', 'ep'], default='mc_dropout',
+                    help='Which model architecture to use')
+parser.add_argument('--klweight', type=float, default=1e-4, help='Weight of the KL term in the ELBO loss (bnn only)')
+parser.add_argument('--kmembers', type=int, default=5, help='Number of ensemble members (ep only)')
+parser.add_argument('--wtaeps', type=float, default=0.1,
+                    help='Relaxed-WTA weight for non-winner members (ep only); 0 = hard WTA')
 parser.add_argument('--type', type=str, default='both', help='Loss function type')
 parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
 parser.add_argument('--dis', '-d', type=str, default='', help='Additional description')
@@ -125,7 +133,13 @@ EPOCH = args.ep
 LR = args.lr
 CKP = args.ckp
 l2_loss = nn.MSELoss(reduction='none')
-model = Model_SI(Norm_DataFactors.shape[0]).cuda()
+_model_ctor = {'si': Model_SI, 'mc_dropout': Model_MC_Dropout, 'bnn': Model_BNN}
+if args.modeltype == 'ep':
+    model = Model_EP(Norm_DataFactors.shape[0], k=args.kmembers).cuda()
+else:
+    model = _model_ctor[args.modeltype](Norm_DataFactors.shape[0]).cuda()
+is_bnn = isinstance(model, Model_BNN)
+is_ep = isinstance(model, Model_EP)
 del DataFactors, Norm_DataFactors, mask
 gc.collect()
 if args.mode in ['train', 'train_tpu']:
@@ -141,6 +155,34 @@ params_str = '_'.join([
     '{:.2e}'.format(args.lr),
     args.dis
 ])
+
+def wta_loss(pred_log_aggr_k, target, eps):
+    """Relaxed Winner-Takes-All loss cho Ensemble Prediction.
+    pred_log_aggr_k: (k,) log-tổng dự đoán của từng thành viên cho 1 group.
+    target: scalar log-tổng thật (census, đã log10).
+    Chỉ thành viên gần target nhất ('winner') được full gradient; các
+    thành viên còn lại chỉ nhận trọng số eps (0 = hard WTA, giữ eps>0 để
+    tránh 'dead' members không bao giờ được cập nhật)."""
+    per_member = l2_loss(pred_log_aggr_k, target.expand_as(pred_log_aggr_k))
+    winner = torch.argmin(per_member.detach())
+    weights = torch.full_like(per_member, eps)
+    weights[winner] = 1.0
+    return (per_member * weights).sum() / (1.0 + eps * (per_member.numel() - 1))
+
+
+def predict_in_batches_ensemble(model, data, batch_size=65536):
+    """Giống predict_in_batches nhưng giữ nguyên chiều k của Model_EP,
+    trả về mảng (N, k) thay vì (N,)."""
+    preds = []
+    n_samples = data.shape[0]
+    with torch.no_grad():
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            batch = data[start:end].cuda()
+            out = model(batch)
+            preds.append(out.cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
 
 def train_per_tpu():
     region_flat = RegionMask[1].ravel()
@@ -187,15 +229,25 @@ def train_per_tpu():
             pix_idx = group_pixel_idx[g]
             batch_x = in_data_grid[pix_idx].cuda()
 
-            pred = model(batch_x).squeeze(-1)
+            pred = model(batch_x)
             del batch_x
             gc.collect()
-            delog_pred = torch.pow(10, pred)
-            pred_sum = delog_pred.sum()
-            pred_log_aggr = torch.log10(pred_sum)
 
             target = re_data_aggr_by_division[g]
-            loss = l2_loss(pred_log_aggr, target).mean()
+
+            if is_ep:
+                delog_pred = torch.pow(10, pred)
+                pred_sum = delog_pred.sum(dim=0)          # (k,)
+                pred_log_aggr = torch.log10(pred_sum)      # (k,)
+                loss = wta_loss(pred_log_aggr, target, args.wtaeps)
+            else:
+                pred = pred.squeeze(-1)
+                delog_pred = torch.pow(10, pred)
+                pred_sum = delog_pred.sum()
+                pred_log_aggr = torch.log10(pred_sum)
+                loss = l2_loss(pred_log_aggr, target).mean()
+                if is_bnn:
+                    loss = loss + args.klweight * model.kl_loss() / n_groups
 
             optimizer.zero_grad()
             loss.backward()
@@ -236,6 +288,8 @@ def train():
         loss_tpu = l_grid_tpu.mean()
 
         loss = loss_tpu
+        if is_bnn:
+            loss = loss + args.klweight * model.kl_loss() / (m * n)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -314,6 +368,110 @@ def predict_in_batches(model, data, batch_size=65536):
 
     return np.concatenate(preds, axis=0)
 
+def enable_dropout(model):
+    """Bật lại Dropout ở chế độ train trong khi phần còn lại của model ở eval,
+    để lấy được các dự đoán stochastic (MC Dropout) khi suy luận."""
+    model.eval()
+    for m_ in model.modules():
+        if isinstance(m_, nn.Dropout):
+            m_.train()
+
+
+def mapping_interval(n_samples=None, percentiles=(2.5, 97.5), unit=0):
+    """Dự đoán khoảng bất định theo mẫu predict_grid_interval, xử lý TỪNG
+    đơn vị hành chính (bounding-box window theo RegionMask[unit], tương tự
+    ndimage.find_objects trên mastergrid ở bản QRF) thay vì forward toàn
+    lưới cùng lúc:
+    - MC Dropout / BNN: lặp n_samples lần forward trên mỗi đơn vị.
+    - Ensemble Prediction (EP): chỉ 1 forward, k thành viên output chính
+      là các mẫu (không cần vòng lặp sample).
+    Bộ nhớ đỉnh tỉ lệ với kích thước đơn vị hành chính lớn nhất, không phải
+    toàn ảnh.
+    """
+    n_samples = n_samples or args.nsamples
+
+    with torch.no_grad():
+        if is_ep:
+            model.eval()  # 1 forward duy nhất cho ra k thành viên, không cần sample lặp lại
+        elif is_bnn:
+            model.eval()  # BayesianLinear tự sample trọng số mỗi forward, kể cả ở eval mode
+        else:
+            enable_dropout(model)  # MC Dropout: cần bật lại Dropout thủ công
+
+        mask_arr = RegionMask[unit]
+        pop_total_arr = PopDensity[unit] * Area[unit]
+
+        nodata = 0.0
+        mean_map = np.full((m, n), nodata, dtype=np.float32)
+        pct_maps = {p: np.full((m, n), nodata, dtype=np.float32) for p in percentiles}
+
+        max_label = int(np.nanmax(mask_arr))
+        objects = ndimage.find_objects(mask_arr.astype(np.int32), max_label=max_label)
+        district_ids = [d for d in range(1, max_label + 1) if objects[d - 1] is not None]
+        print(f'Processing {len(district_ids)} admin units')
+
+        for district_id in tqdm(district_ids, desc='Uncertainty sampling per admin unit'):
+            row_slice, col_slice = objects[district_id - 1]
+            mask_win = mask_arr[row_slice, col_slice]
+            district_mask = (mask_win == district_id)
+            if not district_mask.any():
+                continue
+
+            rows = np.arange(row_slice.start, row_slice.stop)
+            cols = np.arange(col_slice.start, col_slice.stop)
+            row_idx, col_idx = np.meshgrid(rows, cols, indexing='ij')
+            sel_rows = row_idx[district_mask]
+            sel_cols = col_idx[district_mask]
+            flat_idx = sel_rows * n + sel_cols
+
+            batch_x = in_data_grid[torch.from_numpy(flat_idx).long()]
+
+            if is_ep:
+                # 1 forward -> (n_valid, k); coi k thành viên như k "mẫu"
+                raw = predict_in_batches_ensemble(model, batch_x)  # (n_valid, k)
+                samples = raw.T.astype(np.float32)                # (k, n_valid)
+            else:
+                samples = np.empty((n_samples, flat_idx.size), dtype=np.float32)
+                for s in range(n_samples):
+                    samples[s] = predict_in_batches(model, batch_x)
+            del batch_x
+            gc.collect()
+
+            samples = np.power(10, samples)  # de-log
+            census_total = pop_total_arr[row_slice, col_slice][district_mask][0]
+            sample_totals = samples.sum(axis=1)
+            factors = np.divide(
+                census_total, sample_totals,
+                out=np.zeros_like(sample_totals, dtype=np.float64),
+                where=sample_totals > 0
+            )
+            samples *= factors[:, None]
+
+            mean_map[sel_rows, sel_cols] = samples.mean(axis=0)
+            for p in percentiles:
+                mean_map_tag = pct_maps[p]
+                mean_map_tag[sel_rows, sel_cols] = np.percentile(samples, p, axis=0)
+
+            del samples
+            gc.collect()
+
+        model.eval()  # tắt dropout trở lại sau khi lấy mẫu xong (no-op với BNN)
+
+        population_redistributed_sum_by_su = group_aggregation_(
+            mean_map, RegionMask[0], False, method='sum')[1][1:]
+        np.savetxt(f'map/{args.ckp}_interval.csv',
+                   population_redistributed_sum_by_su, delimiter=',')
+
+        base = args.savepath
+        stem, ext = os.path.splitext(base)
+        copy_geoinfo_and_save_image(args.map, mean_map, f'{stem}_mean{ext}')
+        for p in percentiles:
+            tag = f'p{str(p).replace(".", "")}'
+            copy_geoinfo_and_save_image(args.map, pct_maps[p], f'{stem}_{tag}{ext}')
+
+        print('Saved mean +', list(percentiles), 'percentile rasters.')
+
+
 def mapping():
     with torch.no_grad():
         pop_p = predict_in_batches(model,in_data_grid).reshape((m, n))
@@ -373,5 +531,7 @@ if __name__ == '__main__':
         train_per_tpu()
     elif args.mode == 'map':
         mapping()
+    elif args.mode == 'map_interval':
+        mapping_interval()
     else:
         evaluation(model)
