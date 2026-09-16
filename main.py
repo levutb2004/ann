@@ -26,12 +26,17 @@ parser.add_argument('--mode', type=str,
                     choices=['train', 'train_tpu', 'map', 'map_interval', 'eval'], default='train',
                     help='Program mode')
 parser.add_argument('--nsamples', type=int, default=100, help='Number of posterior/MC Dropout forward passes for mapping_interval')
-parser.add_argument('--modeltype', type=str, choices=['mc_dropout', 'bnn', 'si', 'ep'], default='mc_dropout',
+parser.add_argument('--modeltype', type=str, choices=['mc_dropout', 'bnn', 'si', 'ep', 'pdp', 'npdp'], default='mc_dropout',
                     help='Which model architecture to use')
 parser.add_argument('--klweight', type=float, default=1e-4, help='Weight of the KL term in the ELBO loss (bnn only)')
 parser.add_argument('--kmembers', type=int, default=5, help='Number of ensemble members (ep only)')
 parser.add_argument('--wtaeps', type=float, default=0.1,
                     help='Relaxed-WTA weight for non-winner members (ep only); 0 = hard WTA')
+parser.add_argument('--pdpdist', type=str, choices=['gaussian', 'student_t'], default='gaussian',
+                    help='Distribution family predicted by PDP (pdp only)')
+parser.add_argument('--quantiles', type=float, nargs='+',
+                    default=[0.025, 0.25, 0.5, 0.75, 0.975],
+                    help='Quantile levels predicted by NPDP (npdp only)')
 parser.add_argument('--type', type=str, default='both', help='Loss function type')
 parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
 parser.add_argument('--dis', '-d', type=str, default='', help='Additional description')
@@ -47,6 +52,10 @@ args.map = "data_lib/" + \
 
 if (args.mode == 'map') & (args.savepath == 'None'):
     raise ValueError('Please set the save path.')
+
+os.makedirs('map', exist_ok=True)
+os.makedirs('log', exist_ok=True)
+os.makedirs('checkpoints', exist_ok=True)
 
 # Use arguments
 print("Checkpoint file path:", args.ckp, end='\n')
@@ -136,10 +145,16 @@ l2_loss = nn.MSELoss(reduction='none')
 _model_ctor = {'si': Model_SI, 'mc_dropout': Model_MC_Dropout, 'bnn': Model_BNN}
 if args.modeltype == 'ep':
     model = Model_EP(Norm_DataFactors.shape[0], k=args.kmembers).cuda()
+elif args.modeltype == 'pdp':
+    model = Model_PDP(Norm_DataFactors.shape[0], distribution=args.pdpdist).cuda()
+elif args.modeltype == 'npdp':
+    model = Model_NPDP(Norm_DataFactors.shape[0], quantile_levels=tuple(args.quantiles)).cuda()
 else:
     model = _model_ctor[args.modeltype](Norm_DataFactors.shape[0]).cuda()
 is_bnn = isinstance(model, Model_BNN)
 is_ep = isinstance(model, Model_EP)
+is_pdp = isinstance(model, Model_PDP)
+is_npdp = isinstance(model, Model_NPDP)
 del DataFactors, Norm_DataFactors, mask
 gc.collect()
 if args.mode in ['train', 'train_tpu']:
@@ -171,8 +186,9 @@ def wta_loss(pred_log_aggr_k, target, eps):
 
 
 def predict_in_batches_ensemble(model, data, batch_size=65536):
-    """Giống predict_in_batches nhưng giữ nguyên chiều k của Model_EP,
-    trả về mảng (N, k) thay vì (N,)."""
+    """Giống predict_in_batches nhưng giữ nguyên toàn bộ chiều output
+    (k thành viên của Model_EP, [mu, sigma, ...] của Model_PDP, m quantile
+    của Model_NPDP...), trả về mảng (N, C) thay vì (N,)."""
     preds = []
     n_samples = data.shape[0]
     with torch.no_grad():
@@ -183,6 +199,33 @@ def predict_in_batches_ensemble(model, data, batch_size=65536):
             preds.append(out.cpu().numpy())
     return np.concatenate(preds, axis=0)
 
+
+def predict_point_in_batches(model, data, batch_size=65536):
+    """Trả về một ước lượng điểm (point estimate) dạng (N,) cho MỌI loại
+    model, dùng thống nhất cho validation()/mapping()/evaluation():
+    - SI / MC Dropout / BNN: giá trị output trực tiếp (đã có 1 chiều)
+    - EP: trung bình của k thành viên
+    - PDP: mu (tham số vị trí của phân phối)
+    - NPDP: quantile gần 0.5 nhất trong quantile_levels (xấp xỉ median)
+    """
+    preds = []
+    n_samples = data.shape[0]
+    with torch.no_grad():
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            batch = data[start:end].cuda()
+            out = model(batch)
+            if is_ep:
+                point = out.mean(dim=-1)
+            elif is_pdp:
+                point = out[:, 0]
+            elif is_npdp:
+                mid = torch.argmin(torch.abs(model.quantile_levels - 0.5)).item()
+                point = out[:, mid]
+            else:
+                point = out.squeeze(-1)
+            preds.append(point.cpu().numpy())
+    return np.concatenate(preds, axis=0)
 
 def train_per_tpu():
     region_flat = RegionMask[1].ravel()
@@ -240,6 +283,21 @@ def train_per_tpu():
                 pred_sum = delog_pred.sum(dim=0)          # (k,)
                 pred_log_aggr = torch.log10(pred_sum)      # (k,)
                 loss = wta_loss(pred_log_aggr, target, args.wtaeps)
+            elif is_pdp:
+                mu, sigma = pred[:, :1], pred[:, 1:2]
+                mu_sum = torch.pow(10, mu).sum(dim=0)              # (1,)
+                pred_log_aggr = torch.log10(mu_sum).squeeze(-1)     # scalar
+                # Xấp xỉ: tổng hợp sigma bằng RMS trên toàn bộ pixel của group
+                # (không có ground-truth pixel-level nên không thể lan truyền
+                # phương sai một cách chặt chẽ; đây là ước lượng đại diện).
+                sigma_log_aggr = torch.sqrt((sigma ** 2).mean()) + 1e-6
+                loss = (0.5 * ((pred_log_aggr - target) / sigma_log_aggr) ** 2
+                        + torch.log(sigma_log_aggr))
+            elif is_npdp:
+                delog_q = torch.pow(10, pred)                # (n_pixels, m)
+                q_sum = delog_q.sum(dim=0)                     # (m,)
+                pred_log_aggr = torch.log10(q_sum)              # (m,)
+                loss = model.pinball_loss(pred_log_aggr.unsqueeze(0), target.unsqueeze(0))
             else:
                 pred = pred.squeeze(-1)
                 delog_pred = torch.pow(10, pred)
@@ -271,6 +329,34 @@ def train_per_tpu():
                                'min_rmse': '%.5f' % min_rmse})
         summaryWriter.add_scalar("loss", avg_loss, epoch)
         summaryWriter.add_scalar("rmse", rmse, epoch)
+        
+def forward_full_grid(model, data, batch_size=65536):
+    """Giống predict_in_batches_ensemble nhưng GIỮ LẠI đồ thị gradient (không
+    dùng torch.no_grad()), để train() có thể backprop qua toàn bộ lưới.
+    Trả về tensor CUDA (N, C) — C tuỳ loại model (1, k, 2/4, hoặc m)."""
+    outs = []
+    n_samples = data.shape[0]
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
+        batch = data[start:end].cuda()
+        outs.append(model(batch))
+    return torch.cat(outs, dim=0)
+
+
+def aggregate_channels_torch(values, region_mask):
+    """values: (N, C) tensor CUDA (lưới m*n pixel, C kênh output).
+    region_mask: (m, n) tensor CUDA nhãn vùng (int).
+    Tổng hợp TỪNG kênh riêng biệt bằng aggragate_torch (vốn chỉ nhận input
+    1 kênh dạng (m, n)), rồi ghép lại. Trả về (n_groups, C), đã bỏ nhãn '0'."""
+    n_channels = values.shape[1]
+    outs = []
+    for c in range(n_channels):
+        v2d = values[:, c].reshape(region_mask.shape)
+        agg = aggragate_torch(v2d, region_mask)[1:].squeeze(-1)  # (n_groups,)
+        outs.append(agg)
+    return torch.stack(outs, dim=1)  # (n_groups, C)
+
+
 def train():
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     model_flag = timestamp + '_' + params_str
@@ -279,17 +365,42 @@ def train():
     summaryWriter = SummaryWriter(log_root)
     loss_bar = tqdm(range(1, EPOCH+1))
     min_rmse = 1e7
+    region_mask_cuda = torch.from_numpy(RegionMask[1]).cuda()
     for epoch in loss_bar:
-        pop_p_grid = predict_in_batches(model,in_data_grid).reshape(m, n)
-        delog_pop_p_grid = torch.pow(10, pop_p_grid)
-        pop_p_grid_aggr_TPU = torch.log10(aggragate_torch(
-            delog_pop_p_grid, torch.from_numpy(RegionMask[1]))[1:]).squeeze(-1)
-        l_grid_tpu = l2_loss(pop_p_grid_aggr_TPU, re_data_aggr_by_division)
-        loss_tpu = l_grid_tpu.mean()
+        raw_grid = forward_full_grid(model, in_data_grid)  # (m*n, C), CUDA, requires_grad
 
-        loss = loss_tpu
-        if is_bnn:
-            loss = loss + args.klweight * model.kl_loss() / (m * n)
+        if is_ep:
+            delog = torch.pow(10, raw_grid)                              # (N, k)
+            pred_log_aggr = torch.log10(aggregate_channels_torch(delog, region_mask_cuda))  # (n_groups, k)
+            per_group_losses = [
+                wta_loss(pred_log_aggr[g], re_data_aggr_by_division[g], args.wtaeps)
+                for g in range(pred_log_aggr.shape[0])
+            ]
+            loss = torch.stack(per_group_losses).mean()
+        elif is_pdp:
+            mu, sigma = raw_grid[:, :1], raw_grid[:, 1:2]
+            mu_sum = aggregate_channels_torch(torch.pow(10, mu), region_mask_cuda).squeeze(-1)
+            pred_log_aggr = torch.log10(mu_sum)                            # (n_groups,)
+            sigma2_sum = aggregate_channels_torch(sigma ** 2, region_mask_cuda).squeeze(-1)
+            counts = aggregate_channels_torch(torch.ones_like(sigma), region_mask_cuda).squeeze(-1)
+            # Xấp xỉ: RMS của sigma trên các pixel trong group (xem ghi chú
+            # trong train_per_tpu()) — không lan truyền phương sai chặt chẽ.
+            sigma_log_aggr = torch.sqrt(sigma2_sum / counts.clamp(min=1)) + 1e-6
+            loss = (0.5 * ((pred_log_aggr - re_data_aggr_by_division) / sigma_log_aggr) ** 2
+                    + torch.log(sigma_log_aggr)).mean()
+        elif is_npdp:
+            delog_q = torch.pow(10, raw_grid)                              # (N, m)
+            pred_log_aggr = torch.log10(aggregate_channels_torch(delog_q, region_mask_cuda))  # (n_groups, m)
+            loss = model.pinball_loss(pred_log_aggr, re_data_aggr_by_division)
+        else:
+            pop_p_grid = raw_grid.squeeze(-1)                               # (N,)
+            delog_pop_p_grid = torch.pow(10, pop_p_grid).reshape(m, n)
+            pop_p_grid_aggr_TPU = torch.log10(aggragate_torch(
+                delog_pop_p_grid, region_mask_cuda)[1:]).squeeze(-1)
+            loss = l2_loss(pop_p_grid_aggr_TPU, re_data_aggr_by_division).mean()
+            if is_bnn:
+                loss = loss + args.klweight * model.kl_loss() / (m * n)
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -306,10 +417,9 @@ def train():
         summaryWriter.add_scalar("loss", loss.item(), epoch)
         summaryWriter.add_scalar("rmse", rmse, epoch)
         
-
 def validation(model):
     with torch.no_grad():
-        pop_p = predict_in_batches(model,in_data_grid).reshape((m, n))
+        pop_p = predict_point_in_batches(model, in_data_grid).reshape((m, n))
         unit = 1
         population_potential_delog = np.power(10, pop_p)
         sum_potential_delog_by_org_untit = group_aggregation_(
@@ -385,14 +495,20 @@ def mapping_interval(n_samples=None, percentiles=(2.5, 97.5), unit=0):
     - MC Dropout / BNN: lặp n_samples lần forward trên mỗi đơn vị.
     - Ensemble Prediction (EP): chỉ 1 forward, k thành viên output chính
       là các mẫu (không cần vòng lặp sample).
+    - Parametric Distributional Prediction (PDP): chỉ 1 forward ra tham số
+      phân phối (mu, sigma, ...), sau đó sample analytically (torch
+      distributions) — không cần forward NN lại.
+    - Non-Parametric Distributional Prediction (NPDP): chỉ 1 forward ra m
+      quantile, coi trực tiếp các quantile này như "mẫu" (giống cách xử lý
+      k thành viên của EP).
     Bộ nhớ đỉnh tỉ lệ với kích thước đơn vị hành chính lớn nhất, không phải
     toàn ảnh.
     """
     n_samples = n_samples or args.nsamples
 
     with torch.no_grad():
-        if is_ep:
-            model.eval()  # 1 forward duy nhất cho ra k thành viên, không cần sample lặp lại
+        if is_ep or is_pdp or is_npdp:
+            model.eval()  # 1 forward duy nhất, không cần lặp sample
         elif is_bnn:
             model.eval()  # BayesianLinear tự sample trọng số mỗi forward, kể cả ở eval mode
         else:
@@ -426,10 +542,20 @@ def mapping_interval(n_samples=None, percentiles=(2.5, 97.5), unit=0):
 
             batch_x = in_data_grid[torch.from_numpy(flat_idx).long()]
 
-            if is_ep:
-                # 1 forward -> (n_valid, k); coi k thành viên như k "mẫu"
-                raw = predict_in_batches_ensemble(model, batch_x)  # (n_valid, k)
-                samples = raw.T.astype(np.float32)                # (k, n_valid)
+            if is_ep or is_npdp:
+                # EP: 1 forward -> (n_valid, k), coi k thành viên như k "mẫu"
+                # NPDP: 1 forward -> (n_valid, m), coi m quantile như "mẫu"
+                raw = predict_in_batches_ensemble(model, batch_x)  # (n_valid, k hoặc m)
+                samples = raw.T.astype(np.float32)                # (k hoặc m, n_valid)
+            elif is_pdp:
+                # 1 forward -> tham số phân phối, sau đó sample analytically
+                raw = torch.from_numpy(predict_in_batches_ensemble(model, batch_x))
+                if model.distribution == 'gaussian':
+                    dist = torch.distributions.Normal(raw[:, 0], raw[:, 1])
+                else:
+                    dist = torch.distributions.StudentT(
+                        df=raw[:, 2], loc=raw[:, 0], scale=raw[:, 3])
+                samples = dist.sample((n_samples,)).numpy().astype(np.float32)  # (n_samples, n_valid)
             else:
                 samples = np.empty((n_samples, flat_idx.size), dtype=np.float32)
                 for s in range(n_samples):
@@ -474,7 +600,7 @@ def mapping_interval(n_samples=None, percentiles=(2.5, 97.5), unit=0):
 
 def mapping():
     with torch.no_grad():
-        pop_p = predict_in_batches(model,in_data_grid).reshape((m, n))
+        pop_p = predict_point_in_batches(model, in_data_grid).reshape((m, n))
 
         unit = 0
         population_potential_delog = np.power(10, pop_p)
@@ -497,9 +623,7 @@ def mapping():
 def evaluation(model):
     with torch.no_grad():
         model.eval()
-        data = in_data_grid
-        pop_p = model(
-            data, train=True).squeeze(-1).cpu().numpy().reshape((m, n))
+        pop_p = predict_point_in_batches(model, in_data_grid).reshape((m, n))
         unit = 1
         population_potential_delog = np.power(10, pop_p)
         sum_potential_delog_by_org_untit = group_aggregation_(

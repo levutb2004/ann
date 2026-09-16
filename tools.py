@@ -26,23 +26,26 @@ def broadcast_group_values_to_raster(values_by_group, region_layer, nodata_label
 
 def aggragate_torch(value_array, regions, mode='mean'):
     aggr_method = eval('torch.'+mode)
-    sorter = torch.argsort(regions.ravel())
-    # could be optimised...
-    _, inverse_sorter = np.unique(sorter, return_index=True)
-    regions_sort = regions.ravel()[sorter]
+    regions_flat = regions.ravel()
+    device = regions_flat.device
+
+    sorter = torch.argsort(regions_flat)
+    regions_sort = regions_flat[sorter]
     value_array_sort = value_array.ravel()[sorter]
-    # print(value_array_sort)
-    marker_idx = torch.where(torch.diff(regions_sort) == 1)[0]+1
-    reduceat_idx = torch.cat(
-        [torch.tensor([0]), marker_idx, torch.tensor([regions.numel()])])
+
+    marker_idx = torch.where(torch.diff(regions_sort) == 1)[0] + 1
+    reduceat_idx = torch.cat([
+        torch.tensor([0], device=device),
+        marker_idx,
+        torch.tensor([regions.numel()], device=device)
+    ])
     group_counts = reduceat_idx[1:] - reduceat_idx[:-1]
-    vs = torch.zeros(len(group_counts)).cuda()
+
+    vs = torch.zeros(len(group_counts), device=device)
     start = 0
     for i, length in enumerate(group_counts):
         end = start + length
-        # torch.mean(value_array_sort[start:end])
         vs[i] = aggr_method(value_array_sort[start:end])
-        # vs[i] = torch.sum(value_array_sort[start:end])
         start = end
     return vs.squeeze(-1)
 

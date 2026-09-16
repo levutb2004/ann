@@ -116,3 +116,88 @@ class Model_BNN(nn.Module):
 
     def kl_loss(self):
         return self.h1.kl_loss() + self.h2.kl_loss() + self.out.kl_loss()
+
+
+class Model_PDP(nn.Module):
+    """Parametric Distributional Prediction: NN dự đoán tham số của một phân
+    phối xác suất cho y_true, thay vì dự đoán trực tiếp y_true. Loại phân
+    phối chọn trước (a priori): mặc định Gaussian (mu, sigma); có thể mở
+    rộng sang phân phối 4 tham số kiểu GAMLSS (mu, sigma, nu, tau — vd.
+    Student-t lệch) qua distribution='student_t'.
+    Huấn luyện bằng loss tối đa hoá log-likelihood (NLL)."""
+
+    def __init__(self, in_dim, distribution='gaussian'):
+        super(Model_PDP, self).__init__()
+        assert distribution in ('gaussian', 'student_t')
+        self.distribution = distribution
+        self.h1 = nn.Sequential(nn.Linear(in_dim, 32), nn.Sigmoid())
+        self.h2 = nn.Sequential(nn.Linear(32, 32), nn.ReLU())
+        # custom output layer: mu tự do, các tham số còn lại > 0 qua softplus
+        self.mu_head = nn.Linear(32, 1)
+        self.sigma_head = nn.Linear(32, 1)
+        if distribution == 'student_t':
+            self.nu_head = nn.Linear(32, 1)   # bậc tự do (> 2 để có variance hữu hạn)
+            self.tau_head = nn.Linear(32, 1)  # scale phụ
+
+    def forward(self, x, mask=None, train=True):
+        x = self.h1(x)
+        x = self.h2(x)
+        if not train:
+            return x
+        mu = self.mu_head(x)
+        sigma = F.softplus(self.sigma_head(x)) + 1e-6
+        if self.distribution == 'gaussian':
+            return torch.cat([mu, sigma], dim=-1)          # (batch, 2)
+        nu = F.softplus(self.nu_head(x)) + 2.0 + 1e-6       # nu > 2
+        tau = F.softplus(self.tau_head(x)) + 1e-6
+        return torch.cat([mu, sigma, nu, tau], dim=-1)      # (batch, 4)
+
+    def nll_loss(self, params, target):
+        """Negative log-likelihood. target: (batch,) hoặc (batch,1)."""
+        target = target.reshape(-1, 1)
+        if self.distribution == 'gaussian':
+            mu, sigma = params[:, :1], params[:, 1:2]
+            dist = torch.distributions.Normal(mu, sigma)
+        else:
+            mu, sigma, nu, tau = (params[:, :1], params[:, 1:2],
+                                   params[:, 2:3], params[:, 3:4])
+            dist = torch.distributions.StudentT(df=nu, loc=mu, scale=tau + sigma)
+        return -dist.log_prob(target).squeeze(-1)
+
+
+class Model_NPDP(nn.Module):
+    """Non-Parametric Distributional Prediction: NN dự đoán trực tiếp một
+    tập hợp thống kê tóm tắt của y_true (m quantiles) thay vì tham số phân
+    phối. Kiến trúc tránh 'quantile crossing': quantile thấp nhất tự do,
+    các quantile sau = tích luỹ (cumsum) của phần chênh lệch dương (softplus)
+    so với quantile trước — đảm bảo không bao giờ đảo thứ tự.
+    Huấn luyện bằng Pinball (Quantile) Loss."""
+
+    def __init__(self, in_dim, quantile_levels=(0.025, 0.25, 0.5, 0.75, 0.975)):
+        super(Model_NPDP, self).__init__()
+        self.register_buffer(
+            'quantile_levels',
+            torch.tensor(quantile_levels, dtype=torch.float32))
+        self.m = len(quantile_levels)
+        self.h1 = nn.Sequential(nn.Linear(in_dim, 32), nn.Sigmoid())
+        self.h2 = nn.Sequential(nn.Linear(32, 32), nn.ReLU())
+        # custom output layer: chống crossover giữa các quantiles
+        self.q0_head = nn.Linear(32, 1)
+        self.delta_head = nn.Linear(32, self.m - 1)
+
+    def forward(self, x, mask=None, train=True):
+        x = self.h1(x)
+        x = self.h2(x)
+        if not train:
+            return x
+        q0 = self.q0_head(x)                       # (batch, 1)
+        deltas = F.softplus(self.delta_head(x))     # (batch, m-1), luôn > 0
+        return torch.cat([q0, deltas], dim=-1).cumsum(dim=-1)  # (batch, m), tăng dần
+
+    def pinball_loss(self, preds, target):
+        """preds: (batch, m); target: (batch,) hoặc (batch, 1)."""
+        target = target.reshape(-1, 1)
+        taus = self.quantile_levels.to(preds.device)
+        errors = target - preds
+        loss = torch.maximum(taus * errors, (taus - 1) * errors)
+        return loss.mean()
