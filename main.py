@@ -138,6 +138,34 @@ Group_TPU['pop'] = np.log10(Group_TPU['pop']+1)
 re_data_aggr_by_division = torch.from_numpy(
     Group_TPU['pop']).cuda().float().squeeze()
 
+# ==== Pixel-level ground-truth sample (selected_sample.tif) ====
+# 1 band, cùng shape (m, n) với mask; 10000 pixel có giá trị, còn lại nodata = -9999.
+SAMPLE_PATH = "data_lib/selected_sample.tif"
+SAMPLE_NODATA = -9999
+SAMPLE_SPLIT_SEED = 42
+SAMPLE_TRAIN_FRAC = 0.6
+
+sample_arr = gdal.Open(SAMPLE_PATH).ReadAsArray()
+sample_valid_mask = sample_arr != SAMPLE_NODATA
+sample_rows, sample_cols = np.where(sample_valid_mask)
+sample_flat_idx_all = sample_rows * n + sample_cols
+sample_target_raw_all = sample_arr[sample_valid_mask].astype(np.float64)   # population density gốc
+sample_target_log_all = np.log10(sample_target_raw_all + 1)                # cùng scale log10(pop+1) với model
+
+n_sample = len(sample_flat_idx_all)
+print(f"selected_sample.tif: {n_sample} pixel có ground truth", end='\n')
+
+_rng = np.random.default_rng(SAMPLE_SPLIT_SEED)
+_perm = _rng.permutation(n_sample)
+_n_train = int(round(n_sample * SAMPLE_TRAIN_FRAC))
+sample_train_local = _perm[:_n_train]
+sample_test_local = _perm[_n_train:]
+
+sample_flat_idx_train = torch.from_numpy(sample_flat_idx_all[sample_train_local]).long()
+sample_flat_idx_test = torch.from_numpy(sample_flat_idx_all[sample_test_local]).long()
+sample_target_log_train = torch.from_numpy(sample_target_log_all[sample_train_local]).float().cuda()
+sample_target_log_test = torch.from_numpy(sample_target_log_all[sample_test_local]).float().cuda()
+
 EPOCH = args.ep
 LR = args.lr
 CKP = args.ckp
@@ -227,6 +255,32 @@ def predict_point_in_batches(model, data, batch_size=65536):
             preds.append(point.cpu().numpy())
     return np.concatenate(preds, axis=0)
 
+
+def to_point_estimate(out):
+    """Giống logic trong predict_point_in_batches nhưng giữ nguyên gradient
+    (không no_grad), dùng cho forward pixel-level train/test trong train_per_tpu()."""
+    if is_ep:
+        return out.mean(dim=-1)
+    elif is_pdp:
+        return out[:, 0]
+    elif is_npdp:
+        mid = torch.argmin(torch.abs(model.quantile_levels - 0.5)).item()
+        return out[:, mid]
+    else:
+        return out.squeeze(-1)
+
+
+def validation_pixel(model):
+    """RMSE tính trực tiếp trên toàn bộ 10000 pixel của selected_sample.tif
+    (train + test gộp lại), so sánh giá trị population density gốc (de-log)."""
+    with torch.no_grad():
+        batch_x = in_data_grid[torch.from_numpy(sample_flat_idx_all).long()]
+        pred_log = predict_point_in_batches(model, batch_x)
+        pred_raw = np.power(10, pred_log) - 1
+        rmse = np.sqrt(metrics.mean_squared_error(sample_target_raw_all, pred_raw))
+    return rmse
+
+
 def train_per_tpu():
     region_flat = RegionMask[1].ravel()
 
@@ -314,8 +368,22 @@ def train_per_tpu():
 
         avg_loss = epoch_loss / n_groups
 
+        # ---- Bổ sung: forward + loss trên pixel sample (train 0.6 / test 0.4) ----
+        batch_x_train = in_data_grid[sample_flat_idx_train].cuda()
+        pred_train = to_point_estimate(model(batch_x_train))
+        pixel_loss_train = l2_loss(pred_train, sample_target_log_train).mean()
+
+        optimizer.zero_grad()
+        pixel_loss_train.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            batch_x_test = in_data_grid[sample_flat_idx_test].cuda()
+            pred_test = to_point_estimate(model(batch_x_test))
+            pixel_loss_test = l2_loss(pred_test, sample_target_log_test).mean()
+
         model.eval()
-        rmse = validation(model)
+        rmse = validation_pixel(model)
         model.train()
 
         if min_rmse >= rmse.item():
@@ -328,6 +396,8 @@ def train_per_tpu():
                                'RMSE': '%.3f' % rmse,
                                'min_rmse': '%.5f' % min_rmse})
         summaryWriter.add_scalar("loss", avg_loss, epoch)
+        summaryWriter.add_scalar("pixel_loss_train", pixel_loss_train.item(), epoch)
+        summaryWriter.add_scalar("pixel_loss_test", pixel_loss_test.item(), epoch)
         summaryWriter.add_scalar("rmse", rmse, epoch)
         
 def forward_full_grid(model, data, batch_size=65536):
